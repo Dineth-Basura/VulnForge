@@ -1,0 +1,19 @@
+# Python and development caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+*.egg-info/
+build/
+dist/
+
+# Local configuration and engagement artifacts
+.env
+.env.*
+!.env.example
+runs/
+validation/
+*.db
+*.db-shm
+*.db-wal

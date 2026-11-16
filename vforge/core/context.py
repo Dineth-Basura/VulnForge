@@ -1,0 +1,116 @@
+"""Shared engagement state passed to every module.
+
+Modules read prior results from ``ctx.data`` (e.g. subdomains found in recon,
+live URLs found in probe) and append ``Finding`` objects. This is how output of
+one tool becomes input to the next — the core value of an orchestrator.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+
+from vforge.core.auth import AuthConfig
+from vforge.core.roe import RulesOfEngagement
+from vforge.core.urls import as_url
+
+SEVERITIES = ["info", "low", "medium", "high", "critical"]
+
+
+@dataclass
+class Finding:
+    title: str
+    severity: str = "info"
+    module: str = ""
+    target: str = ""
+    evidence: str = ""
+    references: list[str] = field(default_factory=list)
+    metadata: dict = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if self.severity not in SEVERITIES:
+            self.severity = "info"
+
+    def to_dict(self) -> dict:
+        return {
+            "title": self.title,
+            "severity": self.severity,
+            "module": self.module,
+            "target": self.target,
+            "evidence": self.evidence,
+            "references": self.references,
+            "metadata": self.metadata,
+        }
+
+
+@dataclass
+class Context:
+    target: str
+    workdir: Path
+    profile: dict
+    mode: str = "manual"                              # "manual" | "auto"
+    roe: RulesOfEngagement = field(default_factory=RulesOfEngagement)
+    auth: AuthConfig = field(default_factory=AuthConfig)
+    proxy: str = ""                                   # upstream proxy URL (Burp)
+    rate_divisor: int = 1                             # how many targets run concurrently
+    findings: list[Finding] = field(default_factory=list)
+    data: dict = field(default_factory=dict)          # cross-module scratchpad
+    started_at: str = field(
+        default_factory=lambda: datetime.now(timezone.utc).isoformat()
+    )
+
+    def add_finding(self, finding: Finding) -> None:
+        self.findings.append(finding)
+
+    def effective_rate(self) -> int:
+        """Each rate-aware tool's share of the global ``roe.rate_limit`` budget,
+        computed by static division across concurrent targets x rate-aware
+        modules sharing a phase.
+
+        This is a *conservative upper bound*, NOT a true shared token bucket:
+        - it under-shoots rather than over-shoots (safe for staying in scope);
+        - it trusts each tool to honour its own rate flag (we don't meter the
+          actual requests — those happen inside the external binary);
+        - a tool that finishes early does NOT hand its freed share to others;
+        - tools without a usable rate flag are not governed by it.
+        A true global limiter would meter requests at a shared choke point
+        (e.g. an internal throttling proxy) — see the roadmap."""
+        split = max(1, int(self.data.get("_rate_split", 1)))
+        divisor = max(1, self.rate_divisor) * split
+        return max(1, self.roe.rate_limit // divisor)
+
+    # --- cross-phase data accessors -------------------------------------
+
+    def subdomains(self) -> list[str]:
+        """Hosts discovered in the recon phase (target always included)."""
+        from vforge.core.urls import hostname
+
+        hosts = set(self.data.get("subdomains") or [])
+        hosts.add(hostname(self.target))
+        return sorted(hosts)
+
+    def live_urls(self) -> list[str]:
+        """URLs confirmed alive by the probe phase (falls back to the target)."""
+        return self.data.get("live_urls") or [as_url(self.target)]
+
+    def scan_urls(self) -> list[str]:
+        """Everything worth scanning: live roots + crawled endpoints, deduped."""
+        urls = list(self.live_urls()) + list(self.data.get("crawled_urls") or [])
+        seen, out = set(), []
+        for u in urls:
+            if u not in seen:
+                seen.add(u)
+                out.append(u)
+        return out
+
+    def param_urls(self) -> list[str]:
+        """In-scope URLs that carry query parameters — the input for active web
+        tests (SQLi/XSS/param audit)."""
+        return [
+            u for u in self.scan_urls()
+            if "?" in u and "=" in u and self.roe.allows(u)
+        ]
+
+    def artifact_path(self, name: str) -> Path:
+        self.workdir.mkdir(parents=True, exist_ok=True)
+        return self.workdir / name
